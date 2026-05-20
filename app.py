@@ -1,108 +1,97 @@
-import os, re, zipfile, tempfile, uuid, io, subprocess, shutil, json, time
-import urllib.request, urllib.error
+import os, re, zipfile, tempfile, uuid, io, subprocess, shutil, json, datetime
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 from flask import Flask, request, jsonify, send_file, render_template_string
 from docx import Document
 
-# ── PDF support ─────────────────────────────────────────────
 try:
     import pdfplumber
     PDF_SUPPORT = True
 except ImportError:
     PDF_SUPPORT = False
 
-# ── Ollama (local AI — free, no limits, no API key) ──────────
-# Model to use. llama3.2 is fast and accurate for extraction.
-# You can change to "mistral" or "phi3" if preferred.
-OLLAMA_MODEL   = "llama3.2"
-OLLAMA_URL     = "http://localhost:11434/api/generate"
-OLLAMA_ENABLED = False
+OLLAMA_MODEL     = "llama3.2"
+OLLAMA_URL       = "http://localhost:11434/api/generate"
+OLLAMA_ENABLED   = False
+OLLAMA_TIMEOUT   = 120
+PARALLEL_WORKERS = 2
 
 def _check_ollama():
-    """Check if Ollama is running and the model is available."""
+    global OLLAMA_MODEL
     try:
-        req  = urllib.request.urlopen("http://localhost:11434/api/tags", timeout=3)
-        data = json.loads(req.read())
+        req   = urllib.request.urlopen("http://localhost:11434/api/tags", timeout=3)
+        data  = json.loads(req.read())
         models = [m["name"].split(":")[0] for m in data.get("models", [])]
-        if OLLAMA_MODEL in models:
-            print(f"✅ Ollama AI fallback: ENABLED  (model: {OLLAMA_MODEL})")
-            return True
-        else:
-            print(f"⚠  Ollama running but model '{OLLAMA_MODEL}' not found.")
-            print(f"   Run:  ollama pull {OLLAMA_MODEL}")
-            return False
+        for m in [OLLAMA_MODEL, "llama3.2", "mistral", "phi3"]:
+            if m in models:
+                OLLAMA_MODEL = m
+                return True
+        return False
     except Exception:
-        print("⚠  Ollama not running. Start it with:  ollama serve")
-        print("   AI fallback disabled — regex-only mode active.")
         return False
 
 OLLAMA_ENABLED = _check_ollama()
 
-# ── LibreOffice ──────────────────────────────────────────────
 LIBREOFFICE = r"C:\Program Files\LibreOffice\program\soffice.exe"
 if not os.path.exists(LIBREOFFICE):
-    LIBREOFFICE = shutil.which("libreoffice") or shutil.which("soffice")
+    _alt = os.path.expandvars(r"%LOCALAPPDATA%\Programs\LibreOffice\program\soffice.exe")
+    LIBREOFFICE = _alt if os.path.exists(_alt) else (shutil.which("libreoffice") or shutil.which("soffice"))
+
+# History stored in memory (persists while app is running)
+HISTORY = []   # list of {id, name, date, count, errors, session_id}
+SESSIONS = {}  # session_id → rows
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
+
+# ── History storage folder (saves Excel files to disk) ───────
+HISTORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history")
+os.makedirs(HISTORY_DIR, exist_ok=True)
 
 # ============================================================
 # READ HELPERS
 # ============================================================
 
 def read_docx(path):
-    doc   = Document(path)
+    doc = Document(path)
     lines = []
     for para in doc.paragraphs:
         t = para.text.strip()
-        if t:
-            lines.append(t)
+        if t: lines.append(t)
     for table in doc.tables:
         for row in table.rows:
             cells = [c.text.strip() for c in row.cells if c.text.strip()]
-            if cells:
-                lines.append(" | ".join(cells))
+            if cells: lines.append(" | ".join(cells))
     return "\n".join(lines)
 
-
 def convert_doc_to_docx(doc_path, out_dir):
-    if not LIBREOFFICE:
-        return None
+    if not LIBREOFFICE: return None
     try:
-        subprocess.run(
-            [LIBREOFFICE, "--headless", "--convert-to", "docx",
-             "--outdir", out_dir, doc_path],
-            capture_output=True, timeout=30
-        )
-        base      = os.path.splitext(os.path.basename(doc_path))[0]
-        converted = os.path.join(out_dir, base + ".docx")
-        return converted if os.path.exists(converted) else None
-    except Exception:
-        return None
-
+        subprocess.run([LIBREOFFICE,"--headless","--convert-to","docx","--outdir",out_dir,doc_path],
+                       capture_output=True, timeout=30)
+        base = os.path.splitext(os.path.basename(doc_path))[0]
+        conv = os.path.join(out_dir, base + ".docx")
+        return conv if os.path.exists(conv) else None
+    except Exception: return None
 
 def read_pdf(path):
-    if not PDF_SUPPORT:
-        return ""
+    if not PDF_SUPPORT: return ""
     lines = []
     with pdfplumber.open(path) as pdf:
         for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                lines.append(text)
+            t = page.extract_text()
+            if t: lines.append(t)
     return "\n".join(lines)
-
 
 def read_file(path):
     ext = os.path.splitext(path)[1].lower()
-    if ext == ".docx":
-        return read_docx(path)
+    if ext == ".docx": return read_docx(path)
     elif ext == ".doc":
-        tmp       = tempfile.mkdtemp()
-        converted = convert_doc_to_docx(path, tmp)
-        return read_docx(converted) if converted else ""
-    elif ext == ".pdf":
-        return read_pdf(path)
+        tmp = tempfile.mkdtemp()
+        conv = convert_doc_to_docx(path, tmp)
+        return read_docx(conv) if conv else ""
+    elif ext == ".pdf": return read_pdf(path)
     return ""
 
 # ============================================================
@@ -111,96 +100,57 @@ def read_file(path):
 
 def clean_text(text):
     text = text.replace("\xa0", " ")
-    text = re.sub(r'[ \t]+', ' ', text)
-    return text
-
+    return re.sub(r'[ \t]+', ' ', text)
 
 def clean_amount(value):
-    """
-    Clean a rupee amount string.
-    Handles: 1,770.00 / 2,360-00 / 4,720.00.00 / 1770/-
-    """
-    if not value:
-        return ""
+    if not value: return ""
     value = str(value)
     value = re.sub(r'[,\s]', '', value)
     value = value.replace("/-", "")
-    value = re.sub(r'-(?=\d{2}$)', '.', value)          # 2360-00 → 2360.00
-    value = re.sub(r'(\.\d{2})\.\d{2}$', r'\1', value)  # 4720.00.00 → 4720.00
+    value = re.sub(r'-(?=\d{2}$)', '.', value)
+    value = re.sub(r'(\.\d{2})\.\d{2}$', r'\1', value)
     value = value.strip()
-    try:
-        return "{:.2f}".format(float(value))
-    except ValueError:
-        return value
-
+    try: return "{:.2f}".format(float(value))
+    except ValueError: return value
 
 def is_blank(v):
-    if v is None:
-        return True
+    if v is None: return True
     return str(v).strip() in ("", "0", "0.0", "0.00", "None", "nan")
-
-# ============================================================
-# BILL NUMBER
-# 316_UIIC   → 316     (letter after _ separator is NOT part of bill no)
-# 319A_NIA   → 319A    (A directly attached, no separator)
-# 773B_Chola → 773B
-# ============================================================
 
 def extract_bill_no(filename):
     name = os.path.splitext(filename)[0]
-    m    = re.match(r'^(\d+)([A-Za-z]?)(?:[_\-\s]|$)', name)
-    if m:
-        return m.group(1) + m.group(2).upper()
-    return ""
-
-# ============================================================
-# DETECT COMPANY
-# ============================================================
+    m = re.match(r'^(\d+)([A-Za-z]?)(?:[_\-\s]|$)', name)
+    return (m.group(1) + m.group(2).upper()) if m else ""
 
 COMPANY_MAP = {
-    "GODIGIT": "Go Digit General Insurance Ltd",
-    "DIGIT":   "Go Digit General Insurance Ltd",
-    "UIIC":    "United India Insurance Company Ltd",
-    "NICL":    "National Insurance Company Ltd",
-    "NIC":     "National Insurance Company Ltd",
-    "NIA":     "New India Assurance Company Ltd",
-    "SBI":     "SBI General Insurance Company Ltd",
-    "IFFCO":   "Iffco-Tokio General Insurance Company Ltd",
-    "ITGI":    "Iffco-Tokio General Insurance Company Ltd",
-    "OIC":     "The Oriental Insurance Company Ltd",
-    "SGIC":    "Shri Ram General Insurance Company Limited",
-    "SGI":     "Shri Ram General Insurance Company Limited",
-    "CHOLA":   "Chola MS General Insurance Company Ltd",
-    "ACKO":    "Acko General Insurance Limited",
-    "ZUNO":    "Zuno General Insurance Limited",
-    "RAHEJA":  "Raheja QBE General Insurance Company Limited",
-    "USGI":    "Universal Sompo General Insurance Company Ltd",
-    "MGHDI":   "Magma HDI General Insurance Company",
-    "LIBERTY": "Liberty General Insurance Limited",
-    "HDFC":    "HDFC ERGO General Insurance Company Ltd",
-    "BAJAJ":   "Bajaj Allianz General Insurance Company Ltd",
-    "TATA":    "Tata AIG General Insurance Company Ltd",
-    "ICICI":   "ICICI Lombard General Insurance Company Ltd",
-    "RELIANCE":"Reliance General Insurance Company Ltd",
+    "GODIGIT":"Go Digit General Insurance Ltd","DIGIT":"Go Digit General Insurance Ltd",
+    "UIIC":"United India Insurance Company Ltd","NICL":"National Insurance Company Ltd",
+    "NIC":"National Insurance Company Ltd","NIA":"New India Assurance Company Ltd",
+    "SBI":"SBI General Insurance Company Ltd","IFFCO":"Iffco-Tokio General Insurance Company Ltd",
+    "ITGI":"Iffco-Tokio General Insurance Company Ltd","OIC":"The Oriental Insurance Company Ltd",
+    "SGIC":"Shri Ram General Insurance Company Limited","SGI":"Shri Ram General Insurance Company Limited",
+    "CHOLA":"Chola MS General Insurance Company Ltd","ACKO":"Acko General Insurance Limited",
+    "ZUNO":"Zuno General Insurance Limited","RAHEJA":"Raheja QBE General Insurance Company Limited",
+    "USGI":"Universal Sompo General Insurance Company Ltd","MGHDI":"Magma HDI General Insurance Company",
+    "LIBERTY":"Liberty General Insurance Limited","HDFC":"HDFC ERGO General Insurance Company Ltd",
+    "BAJAJ":"Bajaj Allianz General Insurance Company Ltd","TATA":"Tata AIG General Insurance Company Ltd",
+    "ICICI":"ICICI Lombard General Insurance Company Ltd","RELIANCE":"Reliance General Insurance Company Ltd",
 }
 
 def detect_company(filename):
     up = filename.upper()
     for key, val in COMPANY_MAP.items():
-        if key in up:
-            return val
+        if key in up: return val
     return ""
 
 # ============================================================
-# REGEX EXTRACTION
+# EXTRACTION
 # ============================================================
 
 def extract_data(filename, text):
-
     bill_no = extract_bill_no(filename)
     company = detect_company(filename)
 
-    # ── DATE ─────────────────────────────────────────────────
     date = ""
     for pat in [
         r'Invoice\s*Date\s*[:\-]?\s*([0-9]{1,2}[.\/\-][0-9]{1,2}[.\/\-][0-9]{2,4})',
@@ -210,29 +160,21 @@ def extract_data(filename, text):
         r'Dt\.?\s*[:\-]?\s*([0-9]{1,2}[.\/\-][0-9]{1,2}[.\/\-][0-9]{2,4})',
     ]:
         ms = re.findall(pat, text, re.IGNORECASE)
-        if ms:
-            date = ms[0]
-            break
+        if ms: date = ms[0]; break
 
-    # ── CGST ─────────────────────────────────────────────────
     cgst = ""
     for pat in [
         r'Service\s*CGST\s*Amount\s*\|[^\d\n]*([0-9,]+\.[0-9]{2})',
         r'Service\s*CGST\s*Amount[^\d\n]{0,20}([0-9,]+\.[0-9]{2})',
         r'CGST@0?9%\s*\|[^\d\n]*([0-9,]+\.[0-9]{2})',
         r'CGST@0?9%[^\d\n]{0,15}([0-9,]+\.[0-9]{2})',
-        # FORMAT A: "C GST @ 9% | C GST @ 9% | C GST @ 9% | 180.00"
-        # Use larger window (60 chars) to cross the repeated label cells
         r'C\s*GST\s*@\s*0?9\s*%[^\d\n]{0,80}([0-9,]+\.[0-9]{2})',
         r'CGST\s*@\s*0?9\s*%[^\d\n]{0,30}([0-9,]+\.[0-9]{2})',
         r'CGST[^\d\n]{0,25}([0-9,]+\.[0-9]{2})',
     ]:
         ms = re.findall(pat, text, re.IGNORECASE)
-        if ms:
-            cgst = ms[-1]
-            break
+        if ms: cgst = ms[-1]; break
 
-    # ── SGST ─────────────────────────────────────────────────
     sgst = ""
     for pat in [
         r'Service\s*SGST\s*Amount\s*\|[^\d\n]*([0-9,]+\.[0-9]{2})',
@@ -244,17 +186,14 @@ def extract_data(filename, text):
         r'SGST[^\d\n]{0,25}([0-9,]+\.[0-9]{2})',
     ]:
         ms = re.findall(pat, text, re.IGNORECASE)
-        if ms:
-            sgst = ms[-1]
-            break
+        if ms: sgst = ms[-1]; break
 
-    # ── IGST ─────────────────────────────────────────────────
     igst = ""
     for pat in [
         r'IGST\s*Amount\s*\|[^\d\n]*([0-9,]+\.[0-9]{2})',
         r'IGST\s*Amount[^\d\n]{0,20}([0-9,]+\.[0-9]{2})',
         r'ISGST\s*@\s*18\s*%[^\d\n]{0,80}([0-9,]+\.[0-9]{2})',
-        r'ICGST@\s*18\s*%[^\d\n]{0,80}([0-9,]+\.[0-9]{2})',  # Iffco variant
+        r'ICGST@\s*18\s*%[^\d\n]{0,80}([0-9,]+\.[0-9]{2})',
         r'ICGST@18%[^\d\n]{0,80}([0-9,]+\.[0-9]{2})',
         r'GST\s*Tax\s*\|[^\d\n]*@18[^\d\n]*([0-9,]+\.[0-9]{2})',
         r'GST\s*Tax[^\d\n]{0,30}([0-9,]+\.[0-9]{2})',
@@ -262,15 +201,12 @@ def extract_data(filename, text):
         r'IGST[^\d\n]{0,25}([0-9,]+\.[0-9]{2})',
     ]:
         ms = re.findall(pat, text, re.IGNORECASE)
-        if ms:
-            igst = ms[-1]
-            break
+        if ms: igst = ms[-1]; break
 
-    # ── GRAND TOTAL ───────────────────────────────────────────
     grand_total = ""
     for pat in [
         r'Grand\s*Total[^\n]*?([0-9,]+\.[0-9]{2}(?:\.[0-9]{2})?)\s*(?:\|.*)?$',
-        r'Grand\s*Total[^\n]*?([0-9,]+\-[0-9]{2})\s*(?:\|.*)?$',  # 2,360-00 variant
+        r'Grand\s*Total[^\n]*?([0-9,]+\-[0-9]{2})\s*(?:\|.*)?$',
         r'Total\s*Amount\s*\(?In\s*Fig[^\n]*?Rs\.?\s*([0-9,]+(?:\.[0-9]{2})?)',
         r'Total\s*Amount\s*\(?In\s*Fig[^\d\n]{0,30}([0-9,]+\.[0-9]{2})',
         r'Total\s*Amount\s*(?:Payable)?[^\d\n]{0,30}([0-9,]+\.[0-9]{2})',
@@ -280,9 +216,7 @@ def extract_data(filename, text):
         r'Amount\s*Payable[^\d\n]{0,30}([0-9,]+\.[0-9]{2})',
     ]:
         ms = re.findall(pat, text, re.IGNORECASE | re.MULTILINE)
-        if ms:
-            grand_total = ms[-1]
-            break
+        if ms: grand_total = ms[-1]; break
 
     return {
         "Bill No":     bill_no,
@@ -296,460 +230,802 @@ def extract_data(filename, text):
     }
 
 # ============================================================
-# OLLAMA FALLBACK — local AI, free, no limits, no API key
-#
-# GST LAW NOTE: A bill uses EITHER:
-#   IGST  (inter-state)   OR   CGST + SGST (intra-state)
-# Never both. So blank CGST/SGST when IGST exists = correct.
+# OLLAMA FALLBACK
 # ============================================================
 
 def _ollama_ask(prompt):
-    """Send a prompt to local Ollama and return the response text."""
     payload = json.dumps({
-        "model":  OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": 0,      # deterministic — critical for data extraction
-            "num_predict": 200,    # short answer = faster response
-        }
+        "model": OLLAMA_MODEL, "prompt": prompt, "stream": False,
+        "options": {"temperature": 0, "num_predict": 150, "num_ctx": 2048}
     }).encode("utf-8")
-
-    req = urllib.request.Request(
-        OLLAMA_URL,
-        data    = payload,
-        headers = {"Content-Type": "application/json"},
-        method  = "POST"
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read())
-        return data.get("response", "").strip()
-
+    req = urllib.request.Request(OLLAMA_URL, data=payload,
+                                  headers={"Content-Type":"application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
+        return json.loads(resp.read()).get("response","").strip()
 
 def ollama_fill_missing(filename, text, row):
-    """Use local Ollama ONLY to fill fields that regex couldn't find."""
-    if not OLLAMA_ENABLED:
-        return row
-
-    igst_filled = not is_blank(row.get("IGST"))
-    cgst_filled = not is_blank(row.get("CGST"))
-    sgst_filled = not is_blank(row.get("SGST"))
-
+    if not OLLAMA_ENABLED: return row
+    igst_f = not is_blank(row.get("IGST"))
+    cgst_f = not is_blank(row.get("CGST"))
+    sgst_f = not is_blank(row.get("SGST"))
     missing = []
-
-    if is_blank(row.get("Date")):
-        missing.append("invoice_date")
-
-    if is_blank(row.get("Grand Total")):
-        missing.append("grand_total")
-
-    # Only request CGST/SGST if IGST is also blank (inter-state bill)
-    if not igst_filled:
-        if not cgst_filled: missing.append("cgst")
-        if not sgst_filled: missing.append("sgst")
-
-    # Only request IGST if both CGST and SGST are blank (intra-state bill)
-    if not cgst_filled and not sgst_filled:
-        if not igst_filled: missing.append("igst")
-
-    # Sanity-check grand total value
-    try:
-        total   = float(row.get("Grand Total", "0") or "0")
-        gst_sum = sum(float(row.get(k, "0") or "0") for k in ("CGST", "SGST", "IGST"))
-        if total < 100 or (gst_sum > 0 and gst_sum > total):
-            if "grand_total" not in missing:
-                missing.append("grand_total")
-    except Exception:
-        if "grand_total" not in missing:
-            missing.append("grand_total")
-
-    if not missing:
-        return row   # ✅ Regex got everything — skip AI entirely
-
-    print(f"  🤖 Ollama fixing [{filename}] → {missing}")
-
-    prompt = f"""You are a GST invoice data extraction assistant.
-Extract ONLY the following fields from the invoice text: {', '.join(missing)}
-
-STRICT RULES:
-- grand_total: the FINAL total amount payable including ALL taxes. Never the subtotal.
-- invoice_date: the bill/invoice date exactly as written e.g. 12.09.2025
-- cgst: CGST tax amount as a plain number e.g. 180.00
-- sgst: SGST tax amount as a plain number e.g. 180.00
-- igst: IGST tax amount as a plain number e.g. 360.00
-- If a field is not present in the invoice, use empty string "".
-- Return ONLY a valid JSON object with these exact keys. No explanation, no markdown.
-
-Invoice filename: {filename}
-
-Invoice text:
-{text[:4000]}
-
-JSON output:"""
-
+    if is_blank(row.get("Date")): missing.append("invoice_date")
+    if is_blank(row.get("Grand Total")): missing.append("grand_total")
+    if not igst_f and not cgst_f and not sgst_f:
+        missing += ["igst","cgst","sgst"]
+    if total_f := not is_blank(row.get("Grand Total")):
+        try:
+            t = float(row.get("Grand Total","0") or "0")
+            g = sum(float(row.get(k,"0") or "0") for k in ("CGST","SGST","IGST"))
+            if t < 50 or (g > 0 and g > t * 1.01):
+                if "grand_total" not in missing: missing.append("grand_total")
+        except: pass
+    if not missing: return row
+    prompt = f"""Extract fields {', '.join(missing)} from invoice text.
+Rules: grand_total=final payable incl taxes, invoice_date=as written e.g. 12.09.2025, cgst/sgst/igst=plain numbers.
+Return ONLY JSON, no explanation.
+Invoice: {filename}
+Text: {text[:3000]}
+JSON:"""
     try:
         raw  = _ollama_ask(prompt)
-        # Strip markdown fences if model adds them
-        raw  = re.sub(r'```(?:json)?', '', raw).strip().rstrip('`').strip()
-        # Extract first JSON object from response
+        raw  = re.sub(r'```(?:json)?','',raw).strip().rstrip('`').strip()
         m    = re.search(r'\{.*\}', raw, re.DOTALL)
-        if not m:
-            print(f"    ✗ No JSON found in response: {raw[:80]}")
-            return row
+        if not m: return row
         data = json.loads(m.group())
-
-        field_map = {
-            "invoice_date": ("Date",        False),   # False = plain text
-            "grand_total":  ("Grand Total", True),    # True  = clean_amount
-            "cgst":         ("CGST",        True),
-            "sgst":         ("SGST",        True),
-            "igst":         ("IGST",        True),
-        }
-
-        ai_helped = False
-        for ai_key, (excel_key, is_amount) in field_map.items():
-            if ai_key not in missing:
-                continue
-            val = str(data.get(ai_key, "")).strip()
-            if val:
-                row[excel_key] = clean_amount(val) if is_amount else val
-                ai_helped      = True
-                print(f"    ✓ {excel_key} = {row[excel_key]}")
-
-        if ai_helped:
-            row["_ai_filled"] = True
-
-    except json.JSONDecodeError as e:
-        print(f"    ✗ JSON parse error [{filename}]: {e} | raw: {raw[:80]}")
+        field_map = {"invoice_date":("Date",False),"grand_total":("Grand Total",True),
+                     "cgst":("CGST",True),"sgst":("SGST",True),"igst":("IGST",True)}
+        helped = False
+        for ak,(ek,ia) in field_map.items():
+            if ak not in missing: continue
+            v = str(data.get(ak,"")).strip()
+            if v:
+                row[ek] = clean_amount(v) if ia else v
+                helped  = True
+        if helped: row["_ai_filled"] = True
     except Exception as e:
-        print(f"    ✗ Ollama error [{filename}]: {str(e)[:120]}")
-
+        print(f"  AI error [{filename}]: {str(e)[:80]}")
     return row
 
 # ============================================================
-# PROCESS ZIP
+# PROCESS
 # ============================================================
+
+def process_one(fname, fpath):
+    try:
+        raw  = read_file(fpath)
+        text = clean_text(raw)
+        if not text.strip():
+            return None, {"File": fname, "Error": "Could not read file. For .doc files, LibreOffice must be installed."}
+        row = extract_data(fname, text)
+        row = ollama_fill_missing(fname, text, row)
+        return row, None
+    except Exception as e:
+        return None, {"File": fname, "Error": str(e)}
 
 def process_zip(zip_path):
-    results  = []
-    errors   = []
-    seen_nos = {}
-
+    results, errors, seen_nos = [], [], {}
     with tempfile.TemporaryDirectory() as tmp:
-        with zipfile.ZipFile(zip_path, 'r') as zf:
-            zf.extractall(tmp)
-
+        with zipfile.ZipFile(zip_path,'r') as zf: zf.extractall(tmp)
         all_files = []
-        for root, _, files in os.walk(tmp):
+        for root,_,files in os.walk(tmp):
             for fname in files:
-                if fname.startswith("~$"):
-                    continue
+                if fname.startswith("~$"): continue
                 ext = os.path.splitext(fname)[1].lower()
-                if ext in (".docx", ".doc", ".pdf"):
-                    all_files.append((root, fname, ext))
-
-        # .docx before .doc for same base name
-        all_files.sort(key=lambda x: (x[1], 0 if x[2] == ".docx" else 1))
-
-        seen_files = set()
-        for root, fname, ext in all_files:
+                if ext in (".docx",".doc",".pdf"):
+                    all_files.append((fname, os.path.join(root,fname), ext))
+        all_files.sort(key=lambda x:(x[0], 0 if x[2]==".docx" else 1))
+        seen_files, unique = set(), []
+        for fname,fpath,ext in all_files:
             base = os.path.splitext(fname)[0]
-            if base in seen_files:
-                continue
-            seen_files.add(base)
-
-            fpath = os.path.join(root, fname)
-            try:
-                raw  = read_file(fpath)
-                text = clean_text(raw)
-                if not text.strip():
-                    errors.append({"File": fname, "Error": "Empty / unreadable — install LibreOffice for .doc"})
-                    continue
-
-                row = extract_data(fname, text)
-                row = ollama_fill_missing(fname, text, row)
-
-                bill_no = row["Bill No"]
-                if bill_no and bill_no in seen_nos:
-                    existing = results[seen_nos[bill_no]]
-                    if sum(1 for v in row.values() if v) > sum(1 for v in existing.values() if v):
-                        results[seen_nos[bill_no]] = row
-                else:
-                    seen_nos[bill_no] = len(results)
-                    results.append(row)
-
-            except Exception as e:
-                errors.append({"File": fname, "Error": str(e)})
-
-    def sort_key(r):
+            if base not in seen_files:
+                seen_files.add(base); unique.append((fname,fpath))
+        with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as ex:
+            futures = {ex.submit(process_one,fn,fp):fn for fn,fp in unique}
+            for future in as_completed(futures):
+                row,err = future.result()
+                if err: errors.append(err)
+                elif row:
+                    bn = row["Bill No"]
+                    if bn and bn in seen_nos:
+                        ex_ = results[seen_nos[bn]]
+                        if sum(1 for v in row.values() if v) > sum(1 for v in ex_.values() if v):
+                            results[seen_nos[bn]] = row
+                    else:
+                        seen_nos[bn] = len(results); results.append(row)
+    def sk(r):
         m = re.match(r'(\d+)', r.get("Bill No",""))
         return (int(m.group(1)) if m else 9999999, r.get("Bill No",""))
-
-    results.sort(key=sort_key)
+    results.sort(key=sk)
     return results, errors
 
+def make_excel(rows):
+    cols   = ["Bill No","Company","Date","Grand Total","IGST","CGST","SGST"]
+    export = [{k:v for k,v in r.items() if not k.startswith("_")} for r in rows]
+    df     = pd.DataFrame(export, columns=cols)
+    buf    = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="GST Details")
+        ws = writer.sheets["GST Details"]
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+        # Header styling
+        hdr_fill = PatternFill("solid", fgColor="1E3A5F")
+        hdr_font = Font(bold=True, color="FFFFFF", size=11)
+        for cell in ws[1]:
+            cell.fill = hdr_fill; cell.font = hdr_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[1].height = 25
+        # Data rows alternating colour
+        light = PatternFill("solid", fgColor="F0F4FA")
+        for i,row in enumerate(ws.iter_rows(min_row=2, max_row=ws.max_row), start=2):
+            for cell in row:
+                cell.alignment = Alignment(horizontal="center")
+                if i % 2 == 0: cell.fill = light
+        # Column widths
+        for col in ws.columns:
+            mx = max(len(str(c.value or "")) for c in col)
+            ws.column_dimensions[col[0].column_letter].width = min(mx+6, 45)
+    buf.seek(0)
+    return buf
+
 # ============================================================
-# HTML TEMPLATE
+# HTML
 # ============================================================
 
-HTML = r"""
-<!DOCTYPE html>
+HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>GST Invoice Extractor</title>
-<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>GST Invoice Manager</title>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700&family=Mulish:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
 <style>
-  :root{--bg:#0a0a0f;--panel:#13131a;--border:#2a2a3a;--accent:#00e5a0;--accent2:#7c6aff;--text:#e8e8f0;--muted:#6b6b80;--danger:#ff4f6a;}
-  *{box-sizing:border-box;margin:0;padding:0;}
-  body{background:var(--bg);color:var(--text);font-family:'DM Mono',monospace;min-height:100vh;overflow-x:hidden;}
-  body::before{content:'';position:fixed;inset:0;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");pointer-events:none;z-index:0;opacity:.4;}
-  .wrap{max-width:1300px;margin:0 auto;padding:2rem;position:relative;z-index:1;}
-  header{display:flex;align-items:center;gap:1rem;margin-bottom:3rem;}
-  .logo{font-family:'Syne',sans-serif;font-weight:800;font-size:2rem;letter-spacing:-.03em;}
-  .logo span{color:var(--accent);}
-  .tag{font-size:.7rem;color:var(--muted);border:1px solid var(--border);padding:.2rem .6rem;border-radius:999px;}
-  .ai-badge{font-size:.7rem;background:rgba(124,106,255,.15);color:var(--accent2);border:1px solid rgba(124,106,255,.3);padding:.2rem .6rem;border-radius:999px;margin-left:auto;}
-  #drop-zone{border:2px dashed var(--border);border-radius:16px;padding:4rem 2rem;text-align:center;cursor:pointer;transition:border-color .25s,background .25s;background:var(--panel);position:relative;overflow:hidden;}
-  #drop-zone:hover,#drop-zone.drag-over{border-color:var(--accent);background:rgba(0,229,160,.04);}
-  #drop-zone .icon{font-size:3rem;margin-bottom:1rem;display:block;}
-  #drop-zone h2{font-family:'Syne',sans-serif;font-size:1.4rem;font-weight:700;margin-bottom:.5rem;}
-  #drop-zone p{color:var(--muted);font-size:.8rem;}
-  #drop-zone input{position:absolute;inset:0;opacity:0;cursor:pointer;}
-  #file-chip{display:none;align-items:center;gap:.75rem;margin-top:1.5rem;background:rgba(0,229,160,.08);border:1px solid rgba(0,229,160,.25);border-radius:12px;padding:.75rem 1.25rem;font-size:.85rem;}
-  #file-chip.show{display:flex;}
-  .fname{color:var(--accent);font-weight:500;}.fsize{color:var(--muted);font-size:.75rem;}
-  .btn{display:inline-flex;align-items:center;gap:.5rem;background:var(--accent);color:#000;font-family:'Syne',sans-serif;font-weight:700;font-size:.9rem;border:none;border-radius:10px;padding:.8rem 1.8rem;cursor:pointer;transition:transform .15s,box-shadow .15s;}
-  .btn:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,229,160,.3);}
-  .btn:disabled{opacity:.4;cursor:not-allowed;transform:none;box-shadow:none;}
-  .btn.secondary{background:transparent;color:var(--accent);border:1px solid var(--accent);}
-  .btn.secondary:hover{background:rgba(0,229,160,.08);}
-  .btn.dl{background:var(--accent2);}
-  .btn.dl:hover{box-shadow:0 8px 24px rgba(124,106,255,.35);}
-  #progress-wrap{display:none;margin-top:2rem;}
-  #progress-wrap.show{display:block;}
-  .prog-label{font-size:.8rem;color:var(--muted);margin-bottom:.5rem;display:flex;justify-content:space-between;}
-  .prog-bar-bg{height:6px;background:var(--border);border-radius:999px;overflow:hidden;}
-  .prog-bar{height:100%;width:0%;background:linear-gradient(90deg,var(--accent),var(--accent2));border-radius:999px;transition:width .4s ease;}
-  #status-text{font-size:.78rem;color:var(--muted);margin-top:.5rem;}
-  #results{display:none;margin-top:3rem;}
-  #results.show{display:block;}
-  .results-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem;flex-wrap:wrap;gap:1rem;}
-  .results-header h3{font-family:'Syne',sans-serif;font-size:1.2rem;font-weight:700;}
-  .stats{display:flex;gap:1rem;flex-wrap:wrap;}
-  .stat{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:.6rem 1.1rem;text-align:center;}
-  .stat .val{font-size:1.3rem;font-weight:700;font-family:'Syne',sans-serif;color:var(--accent);}
-  .stat .lbl{color:var(--muted);font-size:.7rem;margin-top:.1rem;}
-  .info-box{background:rgba(124,106,255,.07);border:1px solid rgba(124,106,255,.2);border-radius:10px;padding:.8rem 1.2rem;font-size:.75rem;color:var(--muted);margin-top:1rem;line-height:1.6;}
-  .info-box strong{color:var(--accent2);}
-  .table-wrap{overflow-x:auto;border-radius:12px;border:1px solid var(--border);}
-  table{width:100%;border-collapse:collapse;font-size:.78rem;}
-  thead tr{background:rgba(255,255,255,.03);}
-  th{padding:.8rem 1rem;text-align:left;color:var(--muted);font-weight:500;border-bottom:1px solid var(--border);white-space:nowrap;font-size:.68rem;letter-spacing:.08em;text-transform:uppercase;}
-  td{padding:.7rem 1rem;border-bottom:1px solid rgba(255,255,255,.04);vertical-align:middle;}
-  tr:last-child td{border-bottom:none;}
-  tr:hover td{background:rgba(255,255,255,.025);}
-  .c-billno{font-family:'Syne',sans-serif;font-weight:800;font-size:.9rem;color:var(--accent);}
-  .c-company{color:var(--text);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-  .c-date{color:#aaa;white-space:nowrap;}
-  .c-total{font-weight:600;color:#fff;}
-  .c-gst{color:#7adbb5;}
-  .rs{font-size:.65rem;color:var(--muted);margin-right:1px;}
-  .empty{color:var(--muted);font-style:italic;font-size:.72rem;}
-  .na{color:#3a3a50;font-size:.7rem;}
-  .ai-row td:first-child{border-left:2px solid var(--accent2);}
-  .ai-tag{font-size:.58rem;background:rgba(124,106,255,.25);color:var(--accent2);padding:.1rem .35rem;border-radius:4px;margin-left:.4rem;}
-  #errors-box{display:none;margin-top:1.5rem;background:rgba(255,79,106,.05);border:1px solid rgba(255,79,106,.2);border-radius:12px;padding:1.25rem;}
-  #errors-box.show{display:block;}
-  #errors-box h4{color:var(--danger);font-family:'Syne',sans-serif;font-size:.9rem;margin-bottom:.75rem;}
-  .err-item{font-size:.75rem;color:var(--muted);padding:.3rem 0;border-bottom:1px solid rgba(255,79,106,.08);}
-  .err-item:last-child{border-bottom:none;}
-  .err-item strong{color:var(--text);}
-  .actions{display:flex;gap:1rem;margin-top:2rem;flex-wrap:wrap;}
+:root{
+  --navy:#1E3A5F;--navy2:#2B4F82;--gold:#C9A84C;--gold2:#E8C96A;
+  --bg:#F5F7FA;--white:#FFFFFF;--text:#1A2B3C;--muted:#6B7E94;
+  --border:#D8E2EE;--success:#2E7D52;--danger:#C0392B;--warn:#C87A1A;
+  --shadow:0 2px 12px rgba(30,58,95,.10);--shadow2:0 8px 32px rgba(30,58,95,.16);
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:'Mulish',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;}
+
+/* ── NAV ── */
+nav{
+  background:var(--navy);height:64px;display:flex;align-items:center;
+  padding:0 2rem;gap:0;position:sticky;top:0;z-index:100;
+  box-shadow:0 2px 16px rgba(0,0,0,.18);
+}
+.nav-brand{
+  font-family:'Playfair Display',serif;font-size:1.35rem;font-weight:700;
+  color:var(--white);letter-spacing:.02em;margin-right:3rem;white-space:nowrap;
+}
+.nav-brand span{color:var(--gold);}
+.nav-links{display:flex;gap:.25rem;flex:1;}
+.nav-link{
+  color:rgba(255,255,255,.7);font-size:.82rem;font-weight:600;letter-spacing:.06em;
+  text-transform:uppercase;padding:.5rem 1.1rem;border-radius:6px;cursor:pointer;
+  transition:all .2s;border:none;background:none;
+}
+.nav-link:hover{color:var(--white);background:rgba(255,255,255,.1);}
+.nav-link.active{color:var(--gold);background:rgba(201,168,76,.12);}
+.nav-status{
+  font-size:.72rem;color:rgba(255,255,255,.5);padding:.3rem .8rem;
+  border:1px solid rgba(255,255,255,.15);border-radius:20px;white-space:nowrap;
+}
+
+/* ── PAGES ── */
+.page{display:none;min-height:calc(100vh - 64px);padding:2.5rem 2rem;}
+.page.active{display:block;}
+.page-inner{max-width:1100px;margin:0 auto;}
+
+/* ── PAGE HEADER ── */
+.page-header{margin-bottom:2rem;}
+.page-header h1{font-family:'Playfair Display',serif;font-size:1.8rem;font-weight:700;color:var(--navy);margin-bottom:.4rem;}
+.page-header p{color:var(--muted);font-size:.9rem;}
+
+/* ── CARDS ── */
+.card{background:var(--white);border-radius:12px;border:1px solid var(--border);padding:2rem;box-shadow:var(--shadow);}
+.card+.card{margin-top:1.5rem;}
+
+/* ── UPLOAD ZONE ── */
+#drop-zone{
+  border:2px dashed var(--border);border-radius:12px;padding:3.5rem 2rem;
+  text-align:center;cursor:pointer;transition:all .25s;background:var(--bg);
+  position:relative;
+}
+#drop-zone:hover,#drop-zone.drag{border-color:var(--gold);background:#FDFAF3;}
+#drop-zone input{position:absolute;inset:0;opacity:0;cursor:pointer;}
+.upload-icon{width:56px;height:56px;border-radius:14px;background:var(--navy);
+  display:flex;align-items:center;justify-content:center;margin:0 auto 1.2rem;}
+.upload-icon svg{width:28px;height:28px;fill:var(--white);}
+#drop-zone h3{font-family:'Playfair Display',serif;font-size:1.2rem;color:var(--navy);margin-bottom:.5rem;}
+#drop-zone p{color:var(--muted);font-size:.83rem;}
+
+/* ── FILE CHIP ── */
+#file-chip{
+  display:none;align-items:center;gap:.75rem;margin-top:1.25rem;
+  background:#EEF4FB;border:1px solid var(--border);border-radius:8px;
+  padding:.7rem 1rem;font-size:.83rem;
+}
+#file-chip.show{display:flex;}
+.chip-icon{width:32px;height:32px;background:var(--navy);border-radius:6px;
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+.chip-icon svg{width:16px;height:16px;fill:white;}
+.chip-name{font-weight:600;color:var(--navy);}
+.chip-size{color:var(--muted);font-size:.76rem;margin-left:.25rem;}
+
+/* ── BUTTONS ── */
+.btn{
+  display:inline-flex;align-items:center;gap:.5rem;font-family:'Mulish',sans-serif;
+  font-weight:700;font-size:.83rem;letter-spacing:.04em;border:none;border-radius:8px;
+  padding:.7rem 1.6rem;cursor:pointer;transition:all .2s;white-space:nowrap;
+}
+.btn-primary{background:var(--navy);color:var(--white);}
+.btn-primary:hover{background:var(--navy2);transform:translateY(-1px);box-shadow:var(--shadow2);}
+.btn-primary:disabled{opacity:.4;cursor:not-allowed;transform:none;box-shadow:none;}
+.btn-gold{background:var(--gold);color:var(--navy);}
+.btn-gold:hover{background:var(--gold2);transform:translateY(-1px);box-shadow:var(--shadow2);}
+.btn-outline{background:transparent;color:var(--navy);border:1.5px solid var(--border);}
+.btn-outline:hover{border-color:var(--navy);background:#F0F4FA;}
+.btn-danger-sm{background:transparent;color:var(--danger);border:1px solid var(--danger);
+  padding:.35rem .8rem;font-size:.75rem;border-radius:6px;}
+.btn-danger-sm:hover{background:var(--danger);color:white;}
+
+/* ── PROGRESS ── */
+#prog-wrap{display:none;margin-top:1.5rem;}
+#prog-wrap.show{display:block;}
+.prog-track{height:8px;background:var(--border);border-radius:999px;overflow:hidden;margin:.5rem 0;}
+.prog-fill{height:100%;width:0%;background:linear-gradient(90deg,var(--navy),var(--gold));
+  border-radius:999px;transition:width .5s ease;}
+.prog-info{display:flex;justify-content:space-between;font-size:.78rem;color:var(--muted);}
+
+/* ── STATS ROW ── */
+.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;margin-bottom:1.5rem;}
+.stat-box{background:var(--white);border:1px solid var(--border);border-radius:10px;
+  padding:1.1rem 1.25rem;box-shadow:var(--shadow);transition:box-shadow .2s;}
+.stat-box:hover{box-shadow:var(--shadow2);}
+.stat-num{font-family:'Playfair Display',serif;font-size:1.8rem;font-weight:700;color:var(--navy);line-height:1;}
+.stat-lbl{font-size:.72rem;color:var(--muted);margin-top:.3rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;}
+.stat-box.gold .stat-num{color:var(--gold);}
+.stat-box.red .stat-num{color:var(--danger);}
+.stat-box.green .stat-num{color:var(--success);}
+
+/* ── TABLE ── */
+.tbl-wrap{overflow-x:auto;border-radius:10px;border:1px solid var(--border);}
+table{width:100%;border-collapse:collapse;font-size:.82rem;}
+thead{background:var(--navy);}
+th{
+  padding:.8rem 1rem;text-align:left;color:rgba(255,255,255,.85);font-weight:600;
+  font-size:.72rem;letter-spacing:.07em;text-transform:uppercase;white-space:nowrap;
+}
+th:first-child{border-radius:10px 0 0 0;}th:last-child{border-radius:0 10px 0 0;}
+td{padding:.7rem 1rem;border-bottom:1px solid var(--border);vertical-align:middle;color:var(--text);}
+tr:last-child td{border-bottom:none;}
+tbody tr{transition:background .15s;}
+tbody tr:hover td{background:#EEF4FB;}
+.td-bill{font-weight:700;color:var(--navy);font-size:.88rem;}
+.td-company{color:var(--text);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.td-date{color:var(--muted);white-space:nowrap;}
+.td-amt{font-weight:600;color:var(--navy);}
+.td-gst{color:var(--success);}
+.td-na{color:var(--border);font-size:.75rem;}
+
+/* ── ERRORS ── */
+.error-box{background:#FEF0EF;border:1px solid #F5C6C3;border-radius:10px;
+  padding:1.25rem;margin-top:1.25rem;}
+.error-box h4{color:var(--danger);font-size:.88rem;font-weight:700;margin-bottom:.75rem;}
+.error-item{font-size:.78rem;color:#7A2828;padding:.3rem 0;border-bottom:1px solid #F5C6C3;}
+.error-item:last-child{border-bottom:none;}
+.error-item strong{color:var(--danger);}
+
+/* ── ACTIONS ── */
+.actions-row{display:flex;gap:.75rem;margin-top:1.5rem;flex-wrap:wrap;}
+
+/* ── HISTORY ── */
+.history-empty{text-align:center;padding:3rem;color:var(--muted);}
+.history-empty svg{width:48px;height:48px;fill:var(--border);display:block;margin:0 auto 1rem;}
+.history-table{width:100%;border-collapse:collapse;font-size:.83rem;}
+.history-table th{
+  padding:.7rem 1rem;text-align:left;background:var(--navy);color:rgba(255,255,255,.85);
+  font-size:.72rem;letter-spacing:.07em;text-transform:uppercase;font-weight:600;
+}
+.history-table th:first-child{border-radius:10px 0 0 0;}
+.history-table th:last-child{border-radius:0 10px 0 0;}
+.history-table td{padding:.7rem 1rem;border-bottom:1px solid var(--border);vertical-align:middle;}
+.history-table tr:last-child td{border-bottom:none;}
+.history-table tbody tr{transition:background .15s;}
+.history-table tbody tr:hover td{background:#EEF4FB;}
+.h-badge{display:inline-block;padding:.2rem .6rem;border-radius:20px;font-size:.72rem;font-weight:600;}
+.h-badge.ok{background:#E8F5EE;color:var(--success);}
+.h-badge.warn{background:#FEF3E2;color:var(--warn);}
+
+/* ── HELP ── */
+.help-grid{display:grid;grid-template-columns:1fr 1fr;gap:1.25rem;}
+.help-card{background:var(--white);border:1px solid var(--border);border-radius:10px;
+  padding:1.5rem;box-shadow:var(--shadow);transition:all .2s;}
+.help-card:hover{border-color:var(--gold);box-shadow:var(--shadow2);transform:translateY(-2px);}
+.help-card h3{font-family:'Playfair Display',serif;font-size:1rem;color:var(--navy);
+  margin-bottom:.6rem;display:flex;align-items:center;gap:.5rem;}
+.help-card p,.help-card li{font-size:.83rem;color:var(--muted);line-height:1.6;}
+.help-card ul{padding-left:1.1rem;}
+.step-num{width:24px;height:24px;background:var(--navy);color:white;border-radius:50%;
+  display:inline-flex;align-items:center;justify-content:center;font-size:.72rem;
+  font-weight:700;flex-shrink:0;}
+.faq-item{border-bottom:1px solid var(--border);padding:1rem 0;}
+.faq-item:last-child{border-bottom:none;}
+.faq-q{font-weight:700;color:var(--navy);font-size:.88rem;margin-bottom:.35rem;}
+.faq-a{font-size:.82rem;color:var(--muted);line-height:1.6;}
+.highlight-box{background:linear-gradient(135deg,#EEF4FB,#FDF8EC);border:1px solid var(--border);
+  border-radius:10px;padding:1.25rem 1.5rem;margin-top:1.25rem;}
+.highlight-box h4{color:var(--navy);font-size:.88rem;font-weight:700;margin-bottom:.5rem;}
+.highlight-box p{font-size:.82rem;color:var(--muted);line-height:1.6;}
+
+/* ── RESPONSIVE ── */
+@media(max-width:768px){
+  .stats-row{grid-template-columns:1fr 1fr;}
+  .help-grid{grid-template-columns:1fr;}
+  .nav-link{padding:.5rem .7rem;font-size:.75rem;}
+  .nav-brand{margin-right:1rem;font-size:1.1rem;}
+}
 </style>
 </head>
 <body>
-<div class="wrap">
-  <header>
-    <div class="logo">GST<span>.</span>extract</div>
-    <div class="tag">LOCAL · v6.0</div>
-    <div class="ai-badge">🦙 Ollama AI fallback</div>
-  </header>
 
-  <div id="drop-zone">
-    <input type="file" id="file-input" accept=".zip"/>
-    <span class="icon">📦</span>
-    <h2>Drop your ZIP file here</h2>
-    <p>Pack all bills (.docx / .doc / .pdf) into one ZIP &nbsp;·&nbsp; Handles 500+ bills &nbsp;·&nbsp; AI fills missing fields automatically</p>
+<nav>
+  <div class="nav-brand">GST<span>.</span>Manager</div>
+  <div class="nav-links">
+    <button class="nav-link active" onclick="showPage('extract')">Extract Bills</button>
+    <button class="nav-link" onclick="showPage('history')">History</button>
+    <button class="nav-link" onclick="showPage('help')">Help Guide</button>
+  </div>
+  <div class="nav-status" id="nav-status">Ready</div>
+</nav>
+
+<!-- =========================================================
+     PAGE: EXTRACT
+========================================================= -->
+<div class="page active" id="page-extract">
+<div class="page-inner">
+  <div class="page-header">
+    <h1>Extract GST Details</h1>
+    <p>Upload a ZIP file containing your invoice bills to extract GST information automatically.</p>
   </div>
 
-  <div class="info-box">
-    <strong>Powered by local Ollama AI</strong> — runs on your PC, no internet needed, zero limits, completely free forever.
-    Regex extracts fields first (instant). Ollama fills only what's missing. &nbsp;·&nbsp;
-    <strong>GST Law:</strong> Bills use IGST (inter-state) OR CGST+SGST (intra-state) — never both. Blank GST fields on the other type = correct.
+  <div class="card">
+    <div id="drop-zone">
+      <input type="file" id="file-input" accept=".zip"/>
+      <div class="upload-icon">
+        <svg viewBox="0 0 24 24"><path d="M19.35 10.04A7.49 7.49 0 0 0 12 4C9.11 4 6.6 5.64 5.35 8.04A5.994 5.994 0 0 0 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z"/></svg>
+      </div>
+      <h3>Drop your ZIP file here</h3>
+      <p>Or click to browse &nbsp;&middot;&nbsp; Supports .docx, .doc, .pdf &nbsp;&middot;&nbsp; Up to 500+ bills per batch</p>
+    </div>
+
+    <div id="file-chip">
+      <div class="chip-icon">
+        <svg viewBox="0 0 24 24"><path d="M6 2c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6H6zm7 7V3.5L18.5 9H13z"/></svg>
+      </div>
+      <div>
+        <span class="chip-name" id="chip-name"></span>
+        <span class="chip-size" id="chip-size"></span>
+      </div>
+      <button class="btn btn-outline" style="margin-left:auto;padding:.35rem .8rem;font-size:.75rem" onclick="clearFile()">Remove</button>
+    </div>
+
+    <div style="margin-top:1.25rem;display:flex;gap:.75rem;align-items:center;">
+      <button class="btn btn-primary" id="process-btn" disabled onclick="processFile()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="white"><path d="M8 5v14l11-7z"/></svg>
+        Process Bills
+      </button>
+      <span id="hint-text" style="font-size:.78rem;color:var(--muted)">Select a ZIP file to begin</span>
+    </div>
+
+    <div id="prog-wrap">
+      <div class="prog-info"><span id="prog-msg">Preparing...</span><span id="prog-pct">0%</span></div>
+      <div class="prog-track"><div class="prog-fill" id="prog-fill"></div></div>
+    </div>
   </div>
 
-  <div id="file-chip">
-    <span>📄</span><span class="fname" id="chip-name"></span><span class="fsize" id="chip-size"></span>
-    <span style="margin-left:auto"><button class="btn secondary" style="padding:.4rem .9rem;font-size:.78rem" onclick="clearFile()">✕ Clear</button></span>
-  </div>
-  <div style="margin-top:1.5rem;">
-    <button class="btn" id="process-btn" disabled onclick="processFile()">⚡ Extract GST Data</button>
-  </div>
-
-  <div id="progress-wrap">
-    <div class="prog-label"><span>Processing bills…</span><span id="prog-pct">0%</span></div>
-    <div class="prog-bar-bg"><div class="prog-bar" id="prog-bar"></div></div>
-    <div id="status-text">Initialising…</div>
-  </div>
-
-  <div id="results">
-    <div class="results-header">
-      <h3>Extracted GST Data</h3>
-      <div class="stats">
-        <div class="stat"><div class="val" id="stat-total">0</div><div class="lbl">Total Bills</div></div>
-        <div class="stat"><div class="val" id="stat-ok">0</div><div class="lbl">Extracted</div></div>
-        <div class="stat"><div class="val" id="stat-ai" style="color:var(--accent2)">0</div><div class="lbl">AI Assisted</div></div>
-        <div class="stat"><div class="val" id="stat-err" style="color:var(--danger)">0</div><div class="lbl">Errors</div></div>
+  <!-- RESULTS -->
+  <div id="results-section" style="display:none;margin-top:1.5rem;">
+    <div class="stats-row">
+      <div class="stat-box">
+        <div class="stat-num" id="s-total">0</div>
+        <div class="stat-lbl">Total Bills</div>
+      </div>
+      <div class="stat-box green">
+        <div class="stat-num" id="s-ok">0</div>
+        <div class="stat-lbl">Processed</div>
+      </div>
+      <div class="stat-box red">
+        <div class="stat-num" id="s-err">0</div>
+        <div class="stat-lbl">Errors</div>
+      </div>
+      <div class="stat-box gold">
+        <div class="stat-num" id="s-blank">0</div>
+        <div class="stat-lbl">Incomplete Fields</div>
       </div>
     </div>
 
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Bill No</th><th>Company Name</th><th>Date</th>
-            <th>Grand Total (₹)</th><th>IGST (₹)</th><th>CGST (₹)</th><th>SGST (₹)</th>
-          </tr>
-        </thead>
-        <tbody id="table-body"></tbody>
-      </table>
+    <div class="card" style="padding:0;overflow:hidden;">
+      <div style="padding:1rem 1.5rem;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;">
+        <div>
+          <div style="font-family:'Playfair Display',serif;font-size:1rem;font-weight:600;color:var(--navy)">Extracted Data</div>
+          <div style="font-size:.76rem;color:var(--muted);margin-top:.15rem">Review the results below before downloading</div>
+        </div>
+        <div style="display:flex;gap:.5rem;">
+          <input type="text" id="search-box" placeholder="Search bill or company..." oninput="filterTable()"
+            style="padding:.45rem .85rem;border:1px solid var(--border);border-radius:6px;font-size:.8rem;font-family:Mulish,sans-serif;color:var(--text);outline:none;width:220px;">
+        </div>
+      </div>
+      <div class="tbl-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Bill No</th><th>Company</th><th>Date</th>
+              <th>Grand Total</th><th>IGST</th><th>CGST</th><th>SGST</th>
+            </tr>
+          </thead>
+          <tbody id="tbl-body"></tbody>
+        </table>
+      </div>
     </div>
 
-    <div id="errors-box"><h4>⚠ Files with issues</h4><div id="errors-list"></div></div>
-    <div class="actions">
-      <button class="btn dl" onclick="downloadExcel()">⬇ Download Excel</button>
-      <button class="btn secondary" onclick="resetAll()">↺ Process Another ZIP</button>
+    <div id="error-box" style="display:none;" class="error-box">
+      <h4>Files that could not be read</h4>
+      <div id="error-list"></div>
+    </div>
+
+    <div class="actions-row">
+      <button class="btn btn-gold" onclick="downloadExcel()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+        Download Excel
+      </button>
+      <button class="btn btn-outline" onclick="resetAll()">New Extraction</button>
+    </div>
+  </div>
+
+</div>
+</div>
+
+<!-- =========================================================
+     PAGE: HISTORY
+========================================================= -->
+<div class="page" id="page-history">
+<div class="page-inner">
+  <div class="page-header">
+    <h1>Extraction History</h1>
+    <p>All previous extractions from this session are saved here. Download any previous Excel file anytime.</p>
+  </div>
+  <div class="card" style="padding:0;overflow:hidden;">
+    <div style="padding:1rem 1.5rem;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;">
+      <div style="font-family:'Playfair Display',serif;font-size:1rem;font-weight:600;color:var(--navy)">Previous Extractions</div>
+      <button class="btn btn-outline" style="padding:.4rem .9rem;font-size:.76rem" onclick="clearHistory()">Clear All</button>
+    </div>
+    <div id="history-body"></div>
+  </div>
+</div>
+</div>
+
+<!-- =========================================================
+     PAGE: HELP
+========================================================= -->
+<div class="page" id="page-help">
+<div class="page-inner">
+  <div class="page-header">
+    <h1>Help Guide</h1>
+    <p>Everything you need to know about using GST Manager effectively.</p>
+  </div>
+
+  <div class="help-grid">
+    <div class="help-card">
+      <h3><span class="step-num">1</span> Prepare Your Bills</h3>
+      <ul>
+        <li>Collect all your invoice files (.docx, .doc, or .pdf)</li>
+        <li>Put them all into one folder</li>
+        <li>Select all files, right-click and choose "Send to &rarr; Compressed (ZIP) folder"</li>
+        <li>You can include 500+ bills in a single ZIP</li>
+      </ul>
+    </div>
+    <div class="help-card">
+      <h3><span class="step-num">2</span> Upload and Process</h3>
+      <ul>
+        <li>Go to "Extract Bills" page</li>
+        <li>Drag and drop your ZIP file, or click to browse</li>
+        <li>Click "Process Bills" and wait for extraction to complete</li>
+        <li>Larger batches may take a few minutes</li>
+      </ul>
+    </div>
+    <div class="help-card">
+      <h3><span class="step-num">3</span> Review Results</h3>
+      <ul>
+        <li>Check the extracted data in the table</li>
+        <li>Use the search box to find a specific bill or company</li>
+        <li>Blank (—) in IGST means the bill is intra-state (CGST+SGST used instead) — this is correct</li>
+        <li>Blank (—) in CGST/SGST means the bill is inter-state (IGST used) — also correct</li>
+      </ul>
+    </div>
+    <div class="help-card">
+      <h3><span class="step-num">4</span> Download Excel</h3>
+      <ul>
+        <li>Click "Download Excel" to save the extracted data</li>
+        <li>The Excel file is automatically formatted with headers</li>
+        <li>All previous extractions are saved in the History tab</li>
+        <li>You can re-download any previous extraction anytime</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box" style="margin-top:1.25rem;">
+    <h4>Understanding GST Types</h4>
+    <p>Indian GST has two types depending on whether the transaction is within the same state or across states. <strong>IGST</strong> (Integrated GST at 18%) applies to inter-state transactions. <strong>CGST + SGST</strong> (Central and State GST at 9% each) apply to intra-state transactions. A single bill will always use one or the other — never both. So if a bill shows IGST, the CGST and SGST columns will be blank — that is correct and expected.</p>
+  </div>
+
+  <div class="card" style="margin-top:1.25rem;">
+    <div style="font-family:'Playfair Display',serif;font-size:1.1rem;font-weight:600;color:var(--navy);margin-bottom:1rem;">Frequently Asked Questions</div>
+
+    <div class="faq-item">
+      <div class="faq-q">Why are some fields showing a dash (—)?</div>
+      <div class="faq-a">A dash means the field was not found in the bill. This can be because the bill uses a different format, the file could not be read (especially for older .doc files), or the field genuinely does not exist on that bill.</div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q">Why are .doc files showing as errors?</div>
+      <div class="faq-a">Older .doc format files require LibreOffice to be installed on your computer. Download it free from libreoffice.org, install it, and restart the app. After that, .doc files will be read automatically.</div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q">Can I process files from multiple folders?</div>
+      <div class="faq-a">Yes. Just put all your bill files into one ZIP regardless of their original folder structure. The app will scan all files inside the ZIP automatically.</div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q">How many bills can I process at once?</div>
+      <div class="faq-a">There is no hard limit. The app has been tested with 500+ bills in a single batch. Larger batches simply take more time to process.</div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q">Is my data sent anywhere?</div>
+      <div class="faq-a">No. This application runs entirely on your computer. Your bills and extracted data never leave your machine.</div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q">Why does the Bill No show wrong sometimes?</div>
+      <div class="faq-a">The Bill Number is read from the filename. Name your files starting with the bill number, for example: 319A_NIA_Claim.docx. The app reads the number and optional letter at the start of the filename.</div>
     </div>
   </div>
 </div>
+</div>
 
 <script>
-  let sessionId=null;
-  const dropZone=document.getElementById('drop-zone'),fileInput=document.getElementById('file-input'),
-    fileChip=document.getElementById('file-chip'),processBtn=document.getElementById('process-btn'),
-    progWrap=document.getElementById('progress-wrap'),progBar=document.getElementById('prog-bar'),
-    progPct=document.getElementById('prog-pct'),statusText=document.getElementById('status-text'),
-    resultsDiv=document.getElementById('results');
+let sessionId = null;
+let allRows   = [];
+let history   = [];
 
-  dropZone.addEventListener('dragover',e=>{e.preventDefault();dropZone.classList.add('drag-over');});
-  dropZone.addEventListener('dragleave',()=>dropZone.classList.remove('drag-over'));
-  dropZone.addEventListener('drop',e=>{
-    e.preventDefault();dropZone.classList.remove('drag-over');
-    const f=e.dataTransfer.files[0];
-    if(f&&f.name.endsWith('.zip'))setFile(f);else alert('Please drop a .zip file.');
+// ── NAV ──────────────────────────────────────────────────────
+function showPage(id) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+  document.getElementById('page-'+id).classList.add('active');
+  event.currentTarget.classList.add('active');
+  if (id === 'history') renderHistory();
+}
+
+// ── UPLOAD ───────────────────────────────────────────────────
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault(); dropZone.classList.remove('drag');
+  const f = e.dataTransfer.files[0];
+  if (f && f.name.endsWith('.zip')) setFile(f);
+  else alert('Please drop a .zip file.');
+});
+fileInput.addEventListener('change', () => { if (fileInput.files[0]) setFile(fileInput.files[0]); });
+
+function setFile(f) {
+  document.getElementById('chip-name').textContent = f.name;
+  document.getElementById('chip-size').textContent = '(' + (f.size/1024/1024).toFixed(1) + ' MB)';
+  document.getElementById('file-chip').classList.add('show');
+  document.getElementById('process-btn').disabled = false;
+  document.getElementById('hint-text').textContent = 'Ready to process';
+  document.getElementById('process-btn')._file = f;
+  document.getElementById('process-btn')._name = f.name;
+}
+function clearFile() {
+  fileInput.value = '';
+  document.getElementById('file-chip').classList.remove('show');
+  document.getElementById('process-btn').disabled = true;
+  document.getElementById('hint-text').textContent = 'Select a ZIP file to begin';
+}
+
+// ── PROGRESS ─────────────────────────────────────────────────
+let progInterval = null;
+function startProgress() {
+  let pct = 0;
+  document.getElementById('prog-wrap').classList.add('show');
+  const msgs = ['Reading ZIP file...','Scanning bill documents...','Extracting invoice data...','Processing GST fields...','Sorting results...','Finalising...'];
+  let mi = 0;
+  progInterval = setInterval(() => {
+    pct = Math.min(pct + Math.random()*1.8, 90);
+    document.getElementById('prog-fill').style.width = pct+'%';
+    document.getElementById('prog-pct').textContent = Math.floor(pct)+'%';
+    if (mi < msgs.length && pct > mi*15) document.getElementById('prog-msg').textContent = msgs[mi++];
+  }, 400);
+}
+function endProgress() {
+  clearInterval(progInterval);
+  document.getElementById('prog-fill').style.width = '100%';
+  document.getElementById('prog-pct').textContent = '100%';
+  document.getElementById('prog-msg').textContent = 'Complete';
+}
+
+// ── PROCESS ──────────────────────────────────────────────────
+async function processFile() {
+  const btn = document.getElementById('process-btn');
+  const f   = btn._file;
+  if (!f) return;
+  btn.disabled = true;
+  document.getElementById('results-section').style.display = 'none';
+  document.getElementById('nav-status').textContent = 'Processing...';
+  startProgress();
+  const form = new FormData();
+  form.append('file', f);
+  try {
+    const res  = await fetch('/upload', { method:'POST', body:form });
+    const data = await res.json();
+    endProgress();
+    if (data.error) { alert('Error: ' + data.error); return; }
+    sessionId = data.session_id;
+    allRows   = data.results;
+    document.getElementById('nav-status').textContent = data.results.length + ' bills processed';
+    renderResults(data.results, data.errors);
+    // Save to history
+    addToHistory(btn._name, data.results.length, data.errors.length, data.session_id);
+  } catch(err) {
+    endProgress();
+    alert('Could not connect to server. Is the app running?');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ── RENDER TABLE ─────────────────────────────────────────────
+function rs(v) { return v ? '&#8377;' + v : '<span class="td-na">—</span>'; }
+function rt(v) { return v || '<span class="td-na">—</span>'; }
+function rgst(v, other) {
+  if (v) return '<span class="td-gst">&#8377;' + v + '</span>';
+  if (other) return '<span class="td-na">N/A</span>';
+  return '<span class="td-na">—</span>';
+}
+
+function renderResults(rows, errors) {
+  const blanks = rows.filter(r =>
+    !r['Grand Total'] || (!r.IGST && !r.CGST && !r.SGST) || !r.Date
+  ).length;
+  document.getElementById('s-total').textContent = rows.length + (errors||[]).length;
+  document.getElementById('s-ok').textContent    = rows.length;
+  document.getElementById('s-err').textContent   = (errors||[]).length;
+  document.getElementById('s-blank').textContent = blanks;
+  renderTable(rows);
+  const eb = document.getElementById('error-box');
+  const el = document.getElementById('error-list');
+  if (errors && errors.length) {
+    el.innerHTML = errors.map(e =>
+      `<div class="error-item"><strong>${e.File}</strong> &mdash; ${e.Error}</div>`
+    ).join('');
+    eb.style.display = 'block';
+  } else {
+    eb.style.display = 'none';
+  }
+  document.getElementById('results-section').style.display = 'block';
+}
+
+function renderTable(rows) {
+  const tbody = document.getElementById('tbl-body');
+  tbody.innerHTML = '';
+  rows.forEach(r => {
+    const hasI = !!r.IGST, hasC = !!(r.CGST || r.SGST);
+    const tr = document.createElement('tr');
+    tr.dataset.bill    = (r['Bill No'] || '').toLowerCase();
+    tr.dataset.company = (r.Company || '').toLowerCase();
+    tr.innerHTML =
+      `<td class="td-bill">${rt(r['Bill No'])}</td>` +
+      `<td class="td-company" title="${r.Company||''}">${rt(r.Company)}</td>` +
+      `<td class="td-date">${rt(r.Date)}</td>` +
+      `<td class="td-amt">${rs(r['Grand Total'])}</td>` +
+      `<td>${rgst(r.IGST, hasC)}</td>` +
+      `<td>${rgst(r.CGST, hasI)}</td>` +
+      `<td>${rgst(r.SGST, hasI)}</td>`;
+    tbody.appendChild(tr);
   });
-  fileInput.addEventListener('change',()=>{if(fileInput.files[0])setFile(fileInput.files[0]);});
+}
 
-  function setFile(f){
-    document.getElementById('chip-name').textContent=f.name;
-    document.getElementById('chip-size').textContent=(f.size/1024/1024).toFixed(1)+' MB';
-    fileChip.classList.add('show');processBtn.disabled=false;processBtn._file=f;
-  }
-  function clearFile(){
-    fileInput.value='';fileChip.classList.remove('show');processBtn.disabled=true;processBtn._file=null;
-  }
+function filterTable() {
+  const q = document.getElementById('search-box').value.toLowerCase();
+  document.querySelectorAll('#tbl-body tr').forEach(tr => {
+    const match = tr.dataset.bill.includes(q) || tr.dataset.company.includes(q);
+    tr.style.display = match ? '' : 'none';
+  });
+}
 
-  let progInterval=null;
-  function startFakeProgress(){
-    let pct=0;progWrap.classList.add('show');
-    const msgs=['Reading ZIP…','Extracting files…','Running regex…','AI fixing missing fields…','Deduplicating…','Wrapping up…'];
-    let mi=0;
-    progInterval=setInterval(()=>{
-      pct=Math.min(pct+Math.random()*1.5,90);
-      progBar.style.width=pct+'%';progPct.textContent=Math.floor(pct)+'%';
-      if(mi<msgs.length&&pct>mi*15)statusText.textContent=msgs[mi++];
-    },400);
-  }
-  function finishProgress(){clearInterval(progInterval);progBar.style.width='100%';progPct.textContent='100%';statusText.textContent='Done!';}
+// ── DOWNLOAD ─────────────────────────────────────────────────
+function downloadExcel() {
+  if (sessionId) window.location.href = '/download/' + sessionId;
+}
 
-  async function processFile(){
-    const f=processBtn._file;if(!f)return;
-    processBtn.disabled=true;resultsDiv.classList.remove('show');startFakeProgress();
-    const form=new FormData();form.append('file',f);
-    try{
-      const res=await fetch('/upload',{method:'POST',body:form});
-      const data=await res.json();finishProgress();
-      if(data.error){alert('Server error: '+data.error);return;}
-      sessionId=data.session_id;
-      renderResults(data.results,data.errors,data.ai_count||0);
-    }catch(err){finishProgress();alert('Connection failed: '+err.message);}
-    finally{processBtn.disabled=false;}
-  }
+// ── RESET ────────────────────────────────────────────────────
+function resetAll() {
+  clearFile();
+  document.getElementById('prog-wrap').classList.remove('show');
+  document.getElementById('prog-fill').style.width = '0%';
+  document.getElementById('prog-pct').textContent = '0%';
+  document.getElementById('results-section').style.display = 'none';
+  document.getElementById('nav-status').textContent = 'Ready';
+  sessionId = null; allRows = [];
+}
 
-  function fmtAmt(val){return val?'<span class="rs">₹</span>'+val:'<span class="empty">—</span>';}
-  function fmtTxt(val){return val||'<span class="empty">—</span>';}
-  // Show N/A (greyed) for GST fields that are legitimately absent (other type used)
-  function fmtGst(val,otherFilled){
-    if(val)return'<span class="rs">₹</span>'+val;
-    if(otherFilled)return'<span class="na">N/A</span>';
-    return'<span class="empty">—</span>';
-  }
+// ── HISTORY ──────────────────────────────────────────────────
+function addToHistory(name, count, errors, sid) {
+  history.unshift({
+    id: sid,
+    name: name,
+    date: new Date().toLocaleString('en-IN', {day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'}),
+    count: count,
+    errors: errors,
+  });
+}
 
-  function renderResults(rows,errors,aiCount){
-    document.getElementById('stat-total').textContent=rows.length+(errors||[]).length;
-    document.getElementById('stat-ok').textContent=rows.length;
-    document.getElementById('stat-ai').textContent=aiCount;
-    document.getElementById('stat-err').textContent=(errors||[]).length;
-    const tbody=document.getElementById('table-body');
-    tbody.innerHTML='';
-    rows.forEach(r=>{
-      const aiTag=r._ai_filled?'<span class="ai-tag">AI</span>':'';
-      const hasIgst=!!r.IGST, hasCgst=!!(r.CGST||r.SGST);
-      const tr=document.createElement('tr');
-      if(r._ai_filled)tr.classList.add('ai-row');
-      tr.innerHTML=
-        `<td class="c-billno">${fmtTxt(r['Bill No'])}</td>`+
-        `<td class="c-company" title="${r.Company||''}">${fmtTxt(r.Company)}</td>`+
-        `<td class="c-date">${fmtTxt(r.Date)}${aiTag}</td>`+
-        `<td class="c-total">${fmtAmt(r['Grand Total'])}</td>`+
-        `<td class="c-gst">${fmtGst(r.IGST,hasCgst)}</td>`+
-        `<td class="c-gst">${fmtGst(r.CGST,hasIgst)}</td>`+
-        `<td class="c-gst">${fmtGst(r.SGST,hasIgst)}</td>`;
-      tbody.appendChild(tr);
-    });
-    const errBox=document.getElementById('errors-box'),errList=document.getElementById('errors-list');
-    if(errors&&errors.length){
-      errList.innerHTML=errors.map(e=>`<div class="err-item"><strong>${e.File}</strong> — ${e.Error}</div>`).join('');
-      errBox.classList.add('show');
-    }else errBox.classList.remove('show');
-    resultsDiv.classList.add('show');
+function renderHistory() {
+  const body = document.getElementById('history-body');
+  if (!history.length) {
+    body.innerHTML = `<div class="history-empty">
+      <svg viewBox="0 0 24 24"><path d="M13 3c-4.97 0-9 4.03-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42C8.27 19.99 10.51 21 13 21c4.97 0 9-4.03 9-9s-4.03-9-9-9zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"/></svg>
+      <div style="font-weight:600;color:var(--navy);margin-bottom:.35rem">No history yet</div>
+      <div style="font-size:.82rem">Your extraction history will appear here after you process bills.</div>
+    </div>`;
+    return;
   }
+  body.innerHTML = `<div class="tbl-wrap" style="border-radius:0;border:none;">
+    <table class="history-table">
+      <thead><tr><th>File Name</th><th>Date &amp; Time</th><th>Bills</th><th>Status</th><th>Action</th></tr></thead>
+      <tbody>
+        ${history.map(h => `
+          <tr>
+            <td style="font-weight:600;color:var(--navy)">${h.name}</td>
+            <td style="color:var(--muted);font-size:.8rem">${h.date}</td>
+            <td><strong>${h.count}</strong> bills</td>
+            <td>
+              ${h.errors > 0
+                ? `<span class="h-badge warn">${h.errors} errors</span>`
+                : `<span class="h-badge ok">All read</span>`}
+            </td>
+            <td>
+              <button class="btn btn-outline" style="padding:.35rem .8rem;font-size:.76rem"
+                onclick="window.location.href='/download/${h.id}'">Download Excel</button>
+            </td>
+          </tr>`).join('')}
+      </tbody>
+    </table>
+  </div>`;
+}
 
-  function downloadExcel(){if(sessionId)window.location.href='/download/'+sessionId;}
-  function resetAll(){
-    clearFile();progWrap.classList.remove('show');
-    progBar.style.width='0%';progPct.textContent='0%';statusText.textContent='Initialising…';
-    resultsDiv.classList.remove('show');
-    document.getElementById('errors-box').classList.remove('show');
-    sessionId=null;
+function clearHistory() {
+  if (!history.length) return;
+  if (confirm('Clear all history? This cannot be undone.')) {
+    history = [];
+    renderHistory();
   }
+}
 </script>
 </body>
-</html>
-"""
+</html>"""
 
 # ============================================================
 # ROUTES
 # ============================================================
 
-SESSIONS = {}
-
 @app.route("/")
 def index():
     return render_template_string(HTML)
-
 
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -762,42 +1038,27 @@ def upload():
     f.save(tmp.name); tmp.close()
     results, errors = process_zip(tmp.name)
     os.unlink(tmp.name)
-    ai_count = sum(1 for r in results if r.get("_ai_filled"))
     sid = str(uuid.uuid4())
     SESSIONS[sid] = results
-    return jsonify({"session_id": sid, "results": results,
-                    "errors": errors, "count": len(results), "ai_count": ai_count})
-
+    # Save Excel to history folder
+    try:
+        buf = make_excel(results)
+        fname = f"gst_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{sid[:8]}.xlsx"
+        with open(os.path.join(HISTORY_DIR, fname), "wb") as fp:
+            fp.write(buf.read())
+    except Exception: pass
+    return jsonify({"session_id": sid, "results": results, "errors": errors, "count": len(results)})
 
 @app.route("/download/<session_id>")
 def download(session_id):
     rows = SESSIONS.get(session_id)
-    if rows is None:
-        return "Session not found", 404
-    export = [{k:v for k,v in r.items() if not k.startswith("_")} for r in rows]
-    cols   = ["Bill No","Company","Date","Grand Total","IGST","CGST","SGST"]
-    df     = pd.DataFrame(export, columns=cols)
-    buf    = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="GST Details")
-        ws = writer.sheets["GST Details"]
-        from openpyxl.styles import Font, PatternFill, Alignment
-        hdr_fill = PatternFill("solid", fgColor="1A1A2E")
-        hdr_font = Font(bold=True, color="00E5A0", size=10)
-        for cell in ws[1]:
-            cell.fill=hdr_fill; cell.font=hdr_font
-            cell.alignment=Alignment(horizontal="center")
-        for col in ws.columns:
-            max_len = max(len(str(c.value or "")) for c in col)
-            ws.column_dimensions[col[0].column_letter].width = min(max_len+4, 45)
-    buf.seek(0)
+    if rows is None: return "Session not found", 404
+    buf = make_excel(rows)
     return send_file(buf, as_attachment=True, download_name="gst_details.xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-
 if __name__ == "__main__":
     print("\n" + "="*50)
-    print("  GST Extractor  →  http://localhost:5000")
-    print(f"  Ollama AI: {'✅ ENABLED  (model: '+OLLAMA_MODEL+')' if OLLAMA_ENABLED else '❌ OFF — regex only'}")
+    print("  GST Manager  →  http://localhost:5000")
     print("="*50 + "\n")
     app.run(debug=True, port=5000)
