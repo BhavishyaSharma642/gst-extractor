@@ -1,0 +1,9 @@
+flask
+python-docx
+pandas
+openpyxl
+pdfplumber
+werkzeug
+libreoffice
+ollama
+# No extra packages needed for Ollama — uses Python's built-in urllib
